@@ -54,6 +54,8 @@ def eval_model(modelname, defect_type, device="cpu", save_plots=False, size=256,
     dataloader_test = DataLoader(test_data_eval, batch_size=64,
                                     shuffle=False, num_workers=0)
 
+    img_list = test_data_eval.image_names
+
     # create model
     if model is None:
         print(f"loading model {modelname}")
@@ -114,7 +116,7 @@ def eval_model(modelname, defect_type, device="cpu", save_plots=False, size=256,
 
             train_data = MVTecAT("Data", defect_type, transform=train_transform, size=size)
             dataloader_train = DataLoader(train_data, batch_size=32,
-                        shuffle=True, num_workers=8, collate_fn=cut_paste_collate_fn,
+                        shuffle=True, num_workers=1, collate_fn=cut_paste_collate_fn,
                         persistent_workers=True)
             # inference training data
             train_labels = []
@@ -152,7 +154,12 @@ def eval_model(modelname, defect_type, device="cpu", save_plots=False, size=256,
     #TODO: set threshold on mahalanobis distances and use "real" probabilities
 
     roc_auc = plot_roc(labels, distances, eval_dir / "roc_plot.png", modelname=modelname, save_plots=save_plots)
-    
+
+    raw_res = []
+    for img_dir, dist in zip(img_list, distances):
+        raw_res.append([img_dir, dist.numpy()])
+    rr = pd.DataFrame(raw_res)
+    rr.to_csv(eval_dir / "raw_results.csv")
 
     return roc_auc
     
