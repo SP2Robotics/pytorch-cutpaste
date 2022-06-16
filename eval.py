@@ -18,15 +18,36 @@ from density import GaussianDensitySklearn, GaussianDensityTorch
 import pandas as pd
 from utils import str2bool
 
+import time
+import torch.onnx
+import pickle
+
 test_data_eval = None
 test_transform = None
 cached_type = None
+batch_size = 1
+
+def Convert_ONNX(model, input_shape, name, eval=True):
+    if eval:
+        model.eval()
+    dummy = torch.randn(input_shape, requires_grad=True)
+
+    torch.onnx.export(model,
+                      dummy,
+                      name,
+                      export_params=True,
+                      opset_version=12,
+                      do_constant_folding=True,
+                      input_names=['modelInput'],
+                      output_names=['modelOutput'],
+                      dynamic_axes={'modelInput': {0: 'batch_size'},
+                                    'modelOutput': {0: 'batch_size'}})
 
 def get_train_embeds(model, size, defect_type, transform, device):
     # train data / train kde
     test_data = MVTecAT("Data", defect_type, size, transform=transform, mode="train")
 
-    dataloader_train = DataLoader(test_data, batch_size=64,
+    dataloader_train = DataLoader(test_data, batch_size=batch_size,
                             shuffle=False, num_workers=0)
     train_embed = []
     with torch.no_grad():
@@ -37,7 +58,9 @@ def get_train_embeds(model, size, defect_type, transform, device):
     train_embed = torch.cat(train_embed)
     return train_embed
 
-def eval_model(modelname, defect_type, device="cpu", save_plots=False, size=256, show_training_data=True, model=None, train_embed=None, head_layer=8, density=GaussianDensityTorch()):
+def eval_model(modelname, defect_type, device="cpu", save_plots=False, size=256,
+               show_training_data=True, model=None, train_embed=None, head_layer=8, density=GaussianDensityTorch(),
+               convert=False):
     # create test dataset
     global test_data_eval,test_transform, cached_type
 
@@ -51,7 +74,7 @@ def eval_model(modelname, defect_type, device="cpu", save_plots=False, size=256,
                                                             std=[0.229, 0.224, 0.225]))
         test_data_eval = MVTecAT("Data", defect_type, size, transform = test_transform, mode="test")
 
-    dataloader_test = DataLoader(test_data_eval, batch_size=64,
+    dataloader_test = DataLoader(test_data_eval, batch_size=batch_size,
                                     shuffle=False, num_workers=0)
 
     img_list = test_data_eval.image_names
@@ -65,19 +88,26 @@ def eval_model(modelname, defect_type, device="cpu", save_plots=False, size=256,
         classes = weights["out.weight"].shape[0]
         model = ProjectionNet(pretrained=False, head_layers=head_layers, num_classes=classes)
         model.load_state_dict(weights)
+        if convert:
+            Convert_ONNX(model, (1,3,256,256), "extractor.onnx")
         model.to(device)
         model.eval()
 
     #get embeddings for test data
     labels = []
     embeds = []
+    times = []
     with torch.no_grad():
         for x, label in dataloader_test:
+            pre = time.time()
             embed, logit = model(x.to(device))
-
+            dt = time.time() - pre
+            times.append(dt)
             # save 
             embeds.append(embed.cpu())
             labels.append(label.cpu())
+    times = np.array(times[1:])
+    print("Model inference time: ", np.mean(times), np.std(times), times.shape)
     labels = torch.cat(labels)
     embeds = torch.cat(embeds)
 
@@ -85,6 +115,7 @@ def eval_model(modelname, defect_type, device="cpu", save_plots=False, size=256,
         train_embed = get_train_embeds(model, size, defect_type, test_transform, device)
 
     # norm embeds
+    temp = embeds
     embeds = torch.nn.functional.normalize(embeds, p=2, dim=1)
     train_embed = torch.nn.functional.normalize(train_embed, p=2, dim=1)
 
@@ -115,7 +146,7 @@ def eval_model(modelname, defect_type, device="cpu", save_plots=False, size=256,
             # train_transform.transforms.append(transforms.ToTensor())
 
             train_data = MVTecAT("Data", defect_type, transform=train_transform, size=size)
-            dataloader_train = DataLoader(train_data, batch_size=32,
+            dataloader_train = DataLoader(train_data, batch_size=batch_size,
                         shuffle=True, num_workers=1, collate_fn=cut_paste_collate_fn,
                         persistent_workers=True)
             # inference training data
@@ -147,9 +178,28 @@ def eval_model(modelname, defect_type, device="cpu", save_plots=False, size=256,
         plot_tsne(tsne_labels, tsne_embeds, eval_dir / "tsne.png")
     else:
         eval_dir = Path("unused")
-    
+
     print(f"using density estimation {density.__class__.__name__}")
     density.fit(train_embed)
+
+    d_mean = density.mean.cpu().numpy()
+    d_inv = density.inv_cov.cpu().numpy()
+    np.save("density_mean.npy", d_mean)
+    np.save("density_inv.npy", d_inv)
+
+    """if convert:
+        Convert_ONNX(density, (1, 512), "estimator.onnx", eval=False)"""
+    
+    times = []
+    for i in range(len(embeds)):
+        pre = time.time()
+        td = torch.reshape(embeds[i], (1, embeds.shape[1]))
+        _ = density.predict(td)
+        dt = time.time() - pre
+        times.append(dt)
+    times = np.array(times[1:])
+    print("Density inference time: ", np.mean(times), np.std(times), times.shape)
+    
     distances = density.predict(embeds)
     #TODO: set threshold on mahalanobis distances and use "real" probabilities
 
@@ -218,6 +268,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--save_plots', default=True, type=str2bool,
                     help='save TSNE and roc plots')
+    parser.add_argument('--convert_onnx', action='store_true')
     
 
     args = parser.parse_args()
@@ -262,7 +313,7 @@ if __name__ == '__main__':
     for model_name, data_type in zip(model_names, types):
         print(f"evaluating {data_type}")
 
-        roc_auc = eval_model(model_name, data_type, save_plots=args.save_plots, device=device, head_layer=args.head_layer, density=density())
+        roc_auc = eval_model(model_name, data_type, save_plots=args.save_plots, device=device, head_layer=args.head_layer, density=density(), convert=args.convert_onnx)
         print(f"{data_type} AUC: {roc_auc}")
         obj["defect_type"].append(data_type)
         obj["roc_auc"].append(roc_auc)
